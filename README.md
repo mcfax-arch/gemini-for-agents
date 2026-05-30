@@ -19,8 +19,8 @@ Google Gemini → OpenAI-compatible API proxy, заточенный под AI-а
 - **Детерминированный planner** — когда Gemini «забывает» вызвать инструмент, синтезатор анализирует запрос и вызывает нужный tool самостоятельно
 - **Retry/repair tool calls** — если Gemini вернула сломанный JSON или пропустила tool call, сервер автоматически перестраивает запрос
 - **Compact tool definitions** — схемы инструментов упакованы в 2–3× меньший размер без потери функциональности
-- **Кроссплатформенный парсинг путей** — корректно извлекает пути Windows (C:\...), Linux (/home/...), macOS (/Users/...) и git-bash (/c/Users/...) в зависимости от ОС
-- **Кроссплатформенный запуск** — один `launch.py` для всех ОС
+- **Кроссплатформенный парсинг путей** — корректно извлекает пути Windows (`C:\...`), Linux (`/home/...`), macOS (`/Users/...`) и git-bash (`/c/Users/...`) в зависимости от ОС
+- **Кроссплатформенный запуск** — один `launch.py` управляет демоном на всех ОС; один `install.py` создаёт сервис автозапуска (Task Scheduler, launchd или systemd)
 
 ---
 
@@ -29,7 +29,7 @@ Google Gemini → OpenAI-compatible API proxy, заточенный под AI-а
 ### Установка (одна команда)
 
 ```bash
-# Linux / macOS / Windows (git-bash, WSL)
+# Linux / macOS / Windows (git-bash, WSL, PowerShell)
 curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.py | python3
 ```
 
@@ -37,10 +37,10 @@ curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/i
 1. Клонирует репозиторий в `~/.gemini-for-agents/`
 2. Определяет вашу ОС
 3. Создаёт сервис автозапуска:
-   - **Windows**: Task Scheduler (скрытый, при входе)
-   - **macOS**: launchd user agent
-   - **Linux**: systemd user service
-4. Запускает сервер
+   - **Windows** → Task Scheduler (скрытый, при входе в систему)
+   - **macOS** → launchd user agent
+   - **Linux** → systemd user service
+4. Запускает сервер на `http://localhost:8081/v1`
 
 После перезагрузки сервер стартует автоматически.
 
@@ -49,22 +49,28 @@ curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/i
 ```bash
 git clone https://github.com/mcfax-arch/gemini-for-agents.git
 cd gemini-for-agents
+```
 
-python launch.py              # запустить как демон
+**Как демон (фоновый процесс):**
+```bash
+python launch.py              # запустить
 python launch.py --status      # проверить статус
 python launch.py --stop        # остановить
 python launch.py --restart     # перезапустить
+```
 
-# Или просто в foreground:
+**Вручную (foreground):**
+```bash
 python gemini_web2api.py
 ```
 
-Сервер стартует на `http://localhost:8081/v1`.
+Сервер доступен на `http://localhost:8081/v1`.
 
 ### Удаление
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.py | python3 - --uninstall
+rm -rf ~/.gemini-for-agents
 ```
 
 ---
@@ -72,27 +78,42 @@ curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/i
 ## Возможности
 
 | Возможность | |
-|-------------|---|
+|---|---|
 | OpenAI-совместимый API (`/v1/chat/completions`) | ✅ |
 | Tool calling (функции) | ✅ **улучшено** |
+| Deterministic planner (авто-вызов инструментов) | ✅ |
 | Streaming (SSE) | ✅ |
 | 6 моделей (Flash, Thinking, Pro, Lite, Auto) | ✅ |
 | Web search (встроенный Gemini Search) | ✅ |
-| Режим консультанта (`@think=N`) | ✅ |
 | Google Native API (`/v1beta/models`) | ✅ |
 | Codex Responses API (`/v1/responses`) | ✅ |
-| Детерминированный planner для tool calls | ✅ |
-| Авто-retry при ошибках инструментов | ✅ |
-| Compact tool definitions | ✅ |
+| Режим консультанта (`@think=N`) | ✅ |
 | Windows / macOS / Linux | ✅ |
 | Автозапуск (Task Scheduler / launchd / systemd) | ✅ |
+| Pure Python (stdlib only) | ✅ |
+
+---
+
+## Файлы проекта
+
+| Файл | Назначение |
+|---|---|
+| `gemini_web2api.py` | Основной сервер (монолитный, ~1300 строк) |
+| `launch.py` | Кроссплатформенный лаунчер (start/stop/status/restart) |
+| `install.py` | Кроссплатформенный установщик сервиса |
+| `start-gemini-web2api.bat` | Обёртка для Windows (совместимость) |
+| `config.json` | Конфигурация (порт, ключи, прокси, cookie) |
+| `config.example.json` | Пример конфигурации |
+| `Dockerfile` | Docker-образ |
+| `docker-compose.local.yml` | Docker Compose |
+| `pyproject.toml` | Метаданные пакета |
 
 ---
 
 ## Модели
 
 | Модель | Описание |
-|--------|----------|
+|---|---|
 | `gemini-3.5-flash` | Быстрая, общего назначения |
 | `gemini-3.5-flash-thinking` | Глубокое рассуждение, длинный вывод |
 | `gemini-3.5-flash-thinking-lite` | Адаптивная глубина |
@@ -140,7 +161,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8081/v1",
-    api_key="anything"
+    api_key="anything"   # не проверяется, если api_keys пустой
 )
 
 resp = client.chat.completions.create(
@@ -170,32 +191,11 @@ curl http://localhost:8081/v1/chat/completions \
   -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### Tool Calling
-
-```python
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash",
-    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            }
-        }
-    }]
-)
-```
-
 ---
 
 ## Конфигурация
 
-Создать `config.json` рядом с `gemini_web2api.py`:
+Создать `config.json` рядом с `gemini_web2api.py` (файл уже в `.gitignore`):
 
 ```json
 {
@@ -213,10 +213,11 @@ resp = client.chat.completions.create(
 ```
 
 | Поле | Описание |
-|------|----------|
+|---|---|
 | `port` | Порт сервера (по умолчанию 8081) |
-| `host` | Адрес (`127.0.0.1` — только localhost, `0.0.0.0` — все интерфейсы) |
-| `api_keys` | Пустой массив — без аутентификации. Если заполнить — требуется `Authorization: Bearer *** `retry_attempts` | Количество повторов при ошибках Gemini |
+| `host` | Интерфейс: `127.0.0.1` — только localhost, `0.0.0.0` — все |
+| `api_keys` | Пустой массив = без аутентификации. Иначе `Authorization: Bearer <key>` |
+| `retry_attempts` | Количество повторов при ошибках Gemini |
 | `cookie_file` | Путь к файлу с cookie для Pro-режима |
 | `proxy` | HTTP-прокси (например, `http://127.0.0.1:7890`) |
 | `log_requests` | Логировать ли запросы |
