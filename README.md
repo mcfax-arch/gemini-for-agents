@@ -1,234 +1,239 @@
-# gemini-web2api
+# Gemini for Agents
 
 <p align="center">
-  <img src="logo.png" width="200" alt="gemini-web2api logo">
+  <img src="logo.png" width="200" alt="gemini-for-agents logo">
 </p>
 
-[中文文档](README_CN.md)
+**Google Gemini** → **OpenAI-compatible API**, заточенный под AI-агентов (Hermes, Claude Code, Codex, OpenCode и любые другие).
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authentication, zero cost, cross-platform.
+Использует Gemini Web API напрямую — **без API-ключа**, бесплатно, с полной поддержкой tool calling.
 
-## Features
+---
 
-- **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
-- **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
-- **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
-- **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
-- **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, no dependencies beyond stdlib
-- **Streaming**: SSE streaming support
-- **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
-- **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+## Чем отличается от оригинала
 
-## Quick Start
+Это форк [gemini-web2api](https://github.com/Sophomoresty/gemini-web2api) с фокусом на работу AI-агентов:
+
+- **Детерминированный planner** — когда Gemini «забывает» вызвать инструмент, синтезатор анализирует запрос и вызывает нужный tool самостоятельно
+- **Retry/repair tool calls** — если Gemini вернула сломанный JSON или пропустила tool call, сервер автоматически перестраивает запрос
+- **Compact tool definitions** — схемы инструментов упакованы в 2-3x меньший размер без потери функциональности
+- **Парсинг под Windows** — корректные POSIX-пути, извлечение shell команд из естественного языка
+
+## Возможности
+
+| Возможность | Статус |
+|-------------|--------|
+| OpenAI-совместимый API (`/v1/chat/completions`) | ✅ |
+| Tool calling (функции) | ✅ **улучшено** |
+| Streaming (SSE) | ✅ |
+| Несколько моделей (Flash, Thinking, Pro, Lite) | ✅ |
+| Web search (встроенный Gemini Search) | ✅ |
+| Режим консультанта (`@think=N`) | ✅ |
+| Google Native API (`/v1beta/models`) | ✅ |
+| Codex Responses API (`/v1/responses`) | ✅ |
+| Детерминированный planner для tool calls | ✅ **новое** |
+| Авто-retry при ошибках инструментов | ✅ **новое** |
+| Compact tool definitions | ✅ **новое** |
+
+## Модели
+
+| Модель | Описание | Context |
+|--------|----------|---------|
+| `gemini-3.5-flash` | Быстрая, общего назначения | ~1M |
+| `gemini-3.5-flash-thinking` | Глубокое рассуждение, длинный вывод | ~1M |
+| `gemini-3.5-flash-thinking-lite` | Адаптивная глубина | ~1M |
+| `gemini-3.1-pro` | Pro (с cookie — реальный Pro) | ~1M |
+| `gemini-auto` | Автовыбор | ~1M |
+| `gemini-flash-lite` | Лёгкая, быстрая | ~1M |
+
+## Быстрый старт
+
+### Вариант 1: Скачать и запустить (Linux / macOS / WSL)
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.sh | bash
+```
+
+Скрипт:
+1. Скачивает последнюю версию
+2. Устанавливает в `~/.gemini-for-agents/`
+3. Создаёт systemd-сервис (Linux) или launchd (macOS)
+4. Запускает сервер на `http://localhost:8081`
+
+### Вариант 2: Windows (PowerShell)
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.ps1 | iex"
+```
+
+Скрипт:
+1. Скачивает последнюю версию
+2. Устанавливает в `$env:USERPROFILE\Documents\gemini-for-agents\`
+3. Создаёт задачу в Task Scheduler (автозапуск при входе)
+4. Запускает сервер скрытно (без окна)
+
+### Вариант 3: Вручную (любая платформа)
+
+```bash
+git clone https://github.com/mcfax-arch/gemini-for-agents.git
+cd gemini-for-agents
+
+# Просто запустить
 python gemini_web2api.py
 ```
 
-Server starts at `http://localhost:8081/v1`.
+Сервер стартует на `http://localhost:8081/v1`.
 
-## Client Configuration
+### Вариант 4: Docker
 
-### Cherry Studio / ChatBox / any OpenAI client
+```bash
+docker run -d --name gemini-for-agents -p 8081:8081 mcfax/gemini-for-agents
+```
 
-| Field | Value |
-|-------|-------|
-| Base URL | `http://localhost:8081/v1` |
-| API Key | any `api_keys` value from `config.json`; anything if not configured |
-| Model | `gemini-3.5-flash-thinking` |
+---
+
+## Использование с AI-агентами
+
+### Hermes Agent
+
+Добавить в `config.yaml`:
+
+```yaml
+providers:
+  gemini-web2api:
+    name: Gemini for Agents
+    base_url: http://127.0.0.1:8081/v1
+    api_key: dummy
+    api_mode: chat_completions
+    discover_models: true
+    models:
+      gemini-3.5-flash:
+        context_length: 1048576
+      gemini-3.5-flash-thinking:
+        context_length: 1048576
+      gemini-3.1-pro:
+        context_length: 1048576
+```
+
+Использовать в fallback chain:
+
+```yaml
+fallback_providers:
+- provider: custom:gemini-web2api-(local)
+  model: gemini-3.5-flash-thinking
+  base_url: http://127.0.0.1:8081/v1
+  api_mode: chat_completions
+```
+
+### Любой OpenAI-клиент
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8081/v1",
+    api_key="anything"  # не проверяется, если api_keys пустой
+)
+
+resp = client.chat.completions.create(
+    model="gemini-3.5-flash-thinking",
+    messages=[{"role": "user", "content": "Hello!"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    }]
+)
+print(resp.choices[0].message.content)
+```
 
 ### curl
 
 ```bash
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
   -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### OpenAI Python SDK
+---
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
-    messages=[{"role": "user", "content": "Explain quantum computing"}]
-)
-print(resp.choices[0].message.content)
-```
+## Конфигурация
 
-### Gemini CLI
-
-```bash
-export GEMINI_API_KEY=none
-export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
-gemini
-```
-
-Supports Google native API endpoints:
-- `GET /v1beta/models` — list models
-- `POST /v1beta/models/{model}:generateContent` — non-streaming
-- `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
-
-## Available Models
-
-| Model | Description | Output |
-|-------|-------------|--------|
-| `gemini-3.5-flash` | Fast general-purpose | ~12k chars |
-| `gemini-3.5-flash-thinking` | Deep thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Pro (needs cookie for real routing) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Lightweight fast | ~10k chars |
-
-### Thinking Depth
-
-Append `@think=N` to any model name:
-
-```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
-gemini-3.5-flash-thinking@think=2   # medium
-gemini-3.5-flash-thinking@think=4   # shallowest
-```
-
-## Optional: Cookie for Pro
-
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, provide a cookie file:
-
-```bash
-python gemini_web2api.py --cookie-file cookie.txt
-```
-
-### How to get cookies
-
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with any free Google account
-2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
-4. Create `cookie.txt` in this format:
-
-```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value
-```
-
-Or use the JSON format:
-```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
-```
-
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
-
-No paid subscription needed — a free Google account is sufficient.
-
-## Configuration
-
-Create `config.json` in the same directory:
+Создать `config.json` в директории сервера:
 
 ```json
 {
   "port": 8081,
-  "host": "0.0.0.0",
+  "host": "127.0.0.1",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
-  "api_keys": ["sk-your-key"],
+  "default_model": "gemini-3.5-flash",
+  "api_keys": [],
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
 }
 ```
 
-When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+- `api_keys: []` — аутентификация отключена
+- `api_keys: ["sk-key1"]` — требуется `Authorization: Bearer sk-key1`
+- `proxy: "http://127.0.0.1:7890"` — HTTP-прокси для Gemini
+- `cookie_file: "/path/to/cookie.txt"` — cookie для Pro-режима
 
-## Docker
+## Cookie для Pro
+
+Для `gemini-3.1-pro` в полную силу нужны cookie из браузера (любой Google-аккаунт):
+
+1. Открыть `gemini.google.com`, войти
+2. DevTools → Application → Cookies → `https://gemini.google.com`
+3. Скопировать: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
+4. Сохранить в файле:
+
+```
+SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx
+```
+
+Запустить: `python gemini_web2api.py --cookie-file cookie.txt`
+
+## Автоматизация
+
+### Windows (Task Scheduler)
+
+```powershell
+.\install.ps1
+```
+
+Создаёт задачу `Hermes Gemini Web2API` — запускает сервер при каждом входе в систему, скрытно, без окна.
+
+### Linux (systemd)
 
 ```bash
-cp config.example.json config.json
-docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+./install.sh
 ```
 
-Or use Docker Compose:
+Создаёт systemd-юнит `gemini-for-agents` — автозапуск при загрузке.
 
-```bash
-cp config.example.json config.json
-docker compose up -d
-```
+---
 
-To mount a cookie file:
+## Ограничения
 
-```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
-```
+- **Нет изображений** — Gemini требует проприетарный RPC-протокол для загрузки
+- **Не настоящий Pro** — без cookie `gemini-3.1-pro` работает как Flash
+- **Rate limits** — Google может throttl'ить частые запросы
+- Только Python 3.8+, без внешних зависимостей (stdlib)
 
-Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+## Как это работает
 
-## Proxy
+Сервер перехватывает OpenAI-формат запросов и пересылает их в Gemini StreamGenerate API — тот же эндпоинт, что использует веб-интерфейс `gemini.google.com`. Выбор модели контролируется полем `[79]` в protobuf-like payload.
 
-If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
-
-**Method 1: CLI argument**
-```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
-```
-
-**Method 2: config.json**
-```json
-{"proxy": "http://127.0.0.1:7890"}
-```
-
-**Method 3: Environment variable** (auto-detected)
-```bash
-export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
-```
-
-Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
-
-## Tool Calling
-
-```python
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash",
-    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-        }
-    }]
-)
-```
-
-## Limitations
-
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
-- **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
-- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
-
-## Requirements
-
-- Python 3.8+
-- No external dependencies (stdlib only)
-- Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
-
-## How It Works
-
-This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal protobuf-like format.
-
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
-
-## Acknowledgments
-
-- [GenericAgent](https://github.com/lsdefine/GenericAgent) — 本项目核心开发依仗 GA 提供的 AI 能力
-- [linux.do](https://linux.do) community
-- Inspired by the open-source API proxy ecosystem
-
-## License
+## Лицензия
 
 MIT

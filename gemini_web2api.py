@@ -56,6 +56,11 @@ DEFAULT_CONFIG = {
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
+    # Tool calling is prompt-emulated because Gemini Web has no public native
+    # function-calling protocol. Keep this strict and compact for agent use.
+    "tool_retry_attempts": 1,
+    "tool_description_max_chars": 220,
+    "tool_property_description_max_chars": 120,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -320,74 +325,559 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
+def _truncate_text(value, max_chars: int) -> str:
+    """Single-line, bounded text for tool declarations."""
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= max_chars else text[: max_chars - 1].rstrip() + "…"
+
+
+def _tool_function(tool: dict) -> dict:
+    return tool.get("function", tool) if isinstance(tool, dict) and tool.get("type") == "function" else (tool or {})
+
+
+def _compact_parameters(parameters: dict) -> dict:
+    """Reduce OpenAI JSON schema to the parts Gemini needs to call tools.
+
+    Real Hermes tool schemas are long and description-heavy. Gemini Web often
+    treats those descriptions as normal chat context and replies with prose
+    instead of a tool call. This compact form keeps names/types/enums/defaults
+    and short descriptions, while removing verbosity.
+    """
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+    required = parameters.get("required") or []
+    props = parameters.get("properties") or {}
+    compact_props = {}
+    for name, spec in props.items():
+        if not isinstance(spec, dict):
+            compact_props[name] = {"type": "string"}
+            continue
+        item = {"type": spec.get("type", "string")}
+        if "enum" in spec:
+            item["enum"] = spec["enum"]
+        if "default" in spec:
+            item["default"] = spec["default"]
+        desc = _truncate_text(spec.get("description", ""), CONFIG.get("tool_property_description_max_chars", 120))
+        if desc:
+            item["description"] = desc
+        if name in required:
+            item["required"] = True
+        compact_props[name] = item
+    return {"type": parameters.get("type", "object"), "required": required, "properties": compact_props}
+
+
+def compact_tool_defs(tools: list) -> list:
+    compact = []
+    for tool in tools or []:
+        fn = _tool_function(tool)
+        name = fn.get("name") or tool.get("name", "") if isinstance(tool, dict) else ""
+        if not name:
+            continue
+        desc = _truncate_text(fn.get("description", ""), CONFIG.get("tool_description_max_chars", 220))
+        compact.append({
+            "name": name,
+            "description": desc,
+            "parameters": _compact_parameters(fn.get("parameters", {})),
+        })
+    return compact
+
+
+def _tool_calls_to_block(tool_calls: list) -> str:
+    calls = []
+    for tc in tool_calls or []:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {"_raw_arguments": args}
+        calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+    return "```tool_calls\n" + json.dumps(calls, ensure_ascii=False, indent=2) + "\n```"
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, list):
+        return " ".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") in ("text", "input_text")
+        )
+    if content is None:
+        return ""
+    return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+
+
 def messages_to_prompt(messages: list, tools: list = None) -> str:
-    """Convert OpenAI messages to prompt string."""
+    """Convert OpenAI messages to a Gemini-Web-friendly prompt string."""
     parts = []
-    if tools:
-        tool_defs = []
-        for tool in tools:
-            fn = tool.get("function", tool) if tool.get("type") == "function" else tool
-            tool_defs.append({
-                "name": fn.get("name", tool.get("name", "")),
-                "description": fn.get("description", tool.get("description", "")),
-                "parameters": fn.get("parameters", tool.get("parameters", {})),
-            })
-        if tool_defs:
-            parts.append(
-                "[System instruction]: You have access to tools. "
-                "To call a tool, respond with:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "Only use tool_call blocks when needed.\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
-            )
+    tool_defs = compact_tool_defs(tools)
+    if tool_defs:
+        parts.append(
+            "[TOOL CONTRACT — STRICT, MACHINE READABLE]\n"
+            "You are connected to an automated tool-execution loop. The tools listed below are AVAILABLE NOW.\n"
+            "Do NOT say a tool is unavailable, failed, inaccessible, or not configured unless a [TOOL RESULT] explicitly says so.\n"
+            "Do NOT browse the web or guess repository/file contents when a local/file/tool answer is needed.\n\n"
+            "When the user asks to inspect/read/list/search/edit/run/check files, current system state, or any information you do not already know, you MUST call tools.\n"
+            "To call tools, your ENTIRE assistant reply must be exactly ONE markdown block named tool_calls containing a JSON array:\n\n"
+            "```tool_calls\n"
+            "[\n"
+            "  {\"name\": \"<exact tool name>\", \"arguments\": { ... }}\n"
+            "]\n"
+            "```\n\n"
+            "GOOD example:\n"
+            "```tool_calls\n"
+            "[{\"name\": \"search_files\", \"arguments\": {\"target\": \"files\", \"path\": \"C:/Users/mcFax\", \"pattern\": \"*\", \"limit\": 5}}]\n"
+            "```\n\n"
+            "BAD examples (do not do these):\n"
+            "- Plain text like: 'I cannot access local files' before trying a tool.\n"
+            "- Shell commands in prose or ```bash fences.\n"
+            "- Tool names not present in Available tools.\n"
+            "- JSON object without the surrounding array.\n\n"
+            "Tool selection guide:\n"
+            "- To list files/directories: use search_files with {\"target\":\"files\", \"path\":..., \"pattern\":\"*\", \"limit\":...}.\n"
+            "- To read contents of a known file: use read_file with {\"path\":...}.\n"
+            "- To write or create a file: use write_file with {\"path\":..., \"content\":...}.\n"
+            "- To edit small portions of a file (replace some text): use patch with {\"path\":..., \"old_string\":..., \"new_string\":...}.\n"
+            "- To run any shell command (ls, dir, echo, wget, etc.): use terminal with {\"command\":...}.\n"
+            "Rules:\n"
+            "1. Tool name must match Available tools exactly.\n"
+            "2. arguments must be a valid JSON object. Use {} if no arguments are needed.\n"
+            "3. If a previous [TOOL RESULT] is present and enough to answer, then answer normally without a tool_calls block.\n"
+            "4. Otherwise, call the next needed tool.\n\n"
+            "Available tools (compact schema):\n"
+            f"{json.dumps(tool_defs, ensure_ascii=False, indent=2)}\n"
+            "[END TOOL CONTRACT]"
+        )
+
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") for c in content
-                if c.get("type") in ("text", "input_text")
-            )
+        content = _content_to_text(msg.get("content", ""))
         if role == "system":
-            parts.append(f"[System instruction]: {content}")
+            parts.append(f"[SYSTEM]:\n{content}")
         elif role == "assistant":
             if msg.get("tool_calls"):
-                tc_strs = []
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {})
-                    tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
-                        f'"arguments": {fn.get("arguments", "{}")}}}\n```'
-                    )
-                parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
+                prefix = f"[ASSISTANT]:\n{content}\n" if content else "[ASSISTANT]:\n"
+                parts.append(prefix + _tool_calls_to_block(msg.get("tool_calls", [])))
             else:
-                parts.append(f"[Assistant]: {content}")
+                parts.append(f"[ASSISTANT]:\n{content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            name = msg.get("name", "")
+            call_id = msg.get("tool_call_id", "")
+            parts.append(f"[TOOL RESULT name={name} id={call_id}]:\n{content}")
         else:
-            parts.append(content if content else "")
-    return "\n\n".join(p for p in parts if p)
+            parts.append(f"[USER]:\n{content}" if role != "user" else content)
+
+    if tool_defs:
+        if _messages_require_tool(messages) and not _messages_have_tool_result(messages):
+            parts.append(
+                "[TOOL REQUIRED FOR THIS TURN — FINAL DIRECTIVE]\n"
+                "The latest user request explicitly requires tool use or local/current inspection.\n"
+                "Your next assistant message MUST be only a ```tool_calls JSON array block.\n"
+                "For listing files, prefer: search_files with target='files', pattern='*', the requested path, and the requested limit.\n"
+                "For reading known files, prefer: read_file with the requested path.\n"
+                "For creating/writing files, prefer: write_file with path and content.\n"
+                "For editing/replacing text in a file, prefer: patch with path, old_string, new_string.\n"
+                "For running shell commands, prefer: terminal with the exact command string.\n"
+                "Do not output prose. Do not say you used a tool. Actually emit the tool call block now."
+            )
+        parts.append(
+            "[SYSTEM REMINDER]: If this request needs a tool and no sufficient [TOOL RESULT] is already present, "
+            "reply ONLY with a ```tool_calls JSON array block. Do not apologize. Do not claim tools are unavailable."
+        )
+    return "\n\n---\n\n".join(p for p in parts if p)
+
+
+def _json_loads_loose(text: str):
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        fixed = text
+        # Common truncation/format repairs from web LLMs.
+        fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+        if fixed.startswith("{") and not fixed.endswith("}"):
+            fixed += "}"
+        if fixed.startswith("[") and not fixed.endswith("]"):
+            fixed += "]"
+        return json.loads(fixed)
+
+
+def _extract_json_payloads(text: str) -> list:
+    payloads = []
+    # Preferred plural block, plus backwards-compatible singular/json blocks.
+    fence_re = r"```(?:tool_calls|tool_call|json)\s*\n(.*?)\n```"
+    for match in re.findall(fence_re, text, re.DOTALL | re.IGNORECASE):
+        payloads.append(match.strip())
+    if payloads:
+        return payloads
+
+    # Last resort: find a JSON array/object containing name+arguments in prose.
+    idxs = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if not idxs:
+        return []
+    start = min(idxs)
+    end = max(text.rfind("]"), text.rfind("}"))
+    if end > start:
+        payloads.append(text[start:end + 1].strip())
+    return payloads
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+    """Extract tool_calls blocks. Returns (clean_text, OpenAI tool_calls_list)."""
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+    for payload in _extract_json_payloads(text or ""):
         try:
-            data = json.loads(match.strip())
+            data = _json_loads_loose(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            # Backwards compatible: {"name":..., "arguments":...}
+            data = [data]
+        if not isinstance(data, list):
+            continue
+        for call in data:
+            if not isinstance(call, dict) or not call.get("name"):
+                continue
+            args = call.get("arguments", {})
+            if args is None:
+                args = {}
+            if isinstance(args, str):
+                # OpenAI wants a JSON string; keep valid JSON strings as-is,
+                # otherwise wrap raw text so Hermes can surface a clear error.
+                try:
+                    json.loads(args) if args.strip() else {}
+                    args_str = args if args.strip() else "{}"
+                except json.JSONDecodeError:
+                    args_str = json.dumps({"_raw_arguments": args}, ensure_ascii=False)
+            else:
+                args_str = json.dumps(args, ensure_ascii=False)
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
+                "function": {"name": call["name"], "arguments": args_str},
             })
-        except (json.JSONDecodeError, KeyError):
-            pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    clean = re.sub(r"```(?:tool_calls|tool_call|json)\s*\n.*?\n```", "", text or "", flags=re.DOTALL | re.IGNORECASE).strip()
     return clean, tool_calls
+
+
+def _prompt_has_tool_result(prompt: str) -> bool:
+    # Actual tool results are serialized as: [TOOL RESULT name=... id=...]
+    # The instruction text also mentions "[TOOL RESULT]" as a concept, so do
+    # not treat that as an executed tool result.
+    return "[TOOL RESULT name=" in (prompt or "")
+
+
+def _messages_have_tool_result(messages: list) -> bool:
+    return any(isinstance(m, dict) and m.get("role") == "tool" for m in messages or [])
+
+
+def _latest_user_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role", "user") == "user":
+            return _content_to_text(msg.get("content", ""))
+    return ""
+
+
+def _messages_require_tool(messages: list) -> bool:
+    t = _latest_user_text(messages).lower()
+    patterns = [
+        "use the tool", "must call", "do not answer directly", "do not answer from memory",
+        "используй инструмент", "использовать инструмент", "не отвечай из памяти",
+        "покажи", "прочитай", "найди", "список файлов", "файлы", "файлов", "директори",
+        "list files", "read file", "search files", "show files", "directory",
+        "c:/", "/c/users", ".py", ".md", ".json",
+    ]
+    return any(p in t for p in patterns)
+
+
+def _looks_like_missed_tool_call(text: str) -> bool:
+    t = (text or "").lower()
+    patterns = [
+        "cannot access", "can't access", "unable to access", "не могу получить доступ",
+        "tool", "инструмент", "воспользовался инструмент", "использовал инструмент",
+        "unavailable", "not available", "not configured",
+        "i would", "я бы", "based on", "looks like", "похоже",
+        "local files", "локаль", "filesystem", "файлов",
+        "as requested", "как требовалось", "как вы просили",
+        # Additional patterns for write/edit/exec hallucination
+        "created file", "wrote to file", "edited the file", "i have created", "i have written",
+        "создал файл", "записал в файл", "отредактировал", "изменил",
+        "ran command", "executed command", "выполнил команду", "запустил",
+        "i will create", "i will write", "i will run", "i will edit",
+        "let me create", "let me write", "let me run",
+    ]
+    return any(p in t for p in patterns)
+
+
+def _looks_like_tool_required_prompt(prompt: str) -> bool:
+    t = (prompt or "").lower()
+    patterns = [
+        # File/directory operations
+        "use the tool", "must call", "do not answer directly", "do not answer from memory",
+        "используй инструмент", "использовать инструмент", "не отвечай из памяти",
+        "покажи", "прочитай", "найди", "список файлов", "файлов", "директори",
+        "list files", "read file", "search files", "show files", "directory",
+        "c:/", "/c/users", ".py", ".md", ".json",
+        # Write/edit operations
+        "write file", "create file", "write to file", "save to file",
+        "запиши в файл", "создай файл", "запиши файл",
+        "edit file", "edit the file", "replace in file", "change file",
+        "редактируй", "измени файл", "замени текст", "исправь",
+        "patch", "old_string", "new_string",
+        # Terminal/exec operations
+        "run command", "execute", "run the following", "run this",
+        "выполни команду", "запусти", "выполни",
+        "команду", "terminal", "shell",
+        # Web/search operations
+        "search the web", "search online", "search internet", "look up",
+        "поищи в интернете", "найди в интернете", "поищи информацию",
+        "web search", "web_extract", "extract from",
+        # Generic "goal-oriented" agent tasks
+        "your task", "you need to", "you must", "first tool",
+    ]
+    return any(p in t for p in patterns)
+
+
+def build_tool_retry_prompt(prompt: str, bad_text: str) -> str:
+    return (
+        f"{prompt}\n\n---\n"
+        "[TOOL FORMAT ERROR — RETRY REQUIRED]\n"
+        "Your previous response was rejected because tools were available but you answered with prose instead of a tool call.\n"
+        "Rejected response preview:\n"
+        f"{_truncate_text(bad_text, 700)}\n\n"
+        "If the task needs local files, system state, current data, inspection, editing, or command execution, "
+        "reply now ONLY with this exact format and no other text:\n"
+        "```tool_calls\n"
+        "[{\"name\": \"<exact available tool name>\", \"arguments\": {}}]\n"
+        "```\n"
+        "Never say tools are unavailable unless a [TOOL RESULT] explicitly says that."
+    )
+
+
+
+def _available_tool_names(tools: list) -> set:
+    names = set()
+    for tool in tools or []:
+        fn = _tool_function(tool)
+        if fn.get("name"):
+            names.add(fn["name"])
+    return names
+
+
+def _extract_windows_or_posix_path(text: str) -> str:
+    # Good enough for agent repair: C:/Users/..., C:\\Users\\..., /c/Users/...
+    # Use the LAST match: the prompt contains examples before the real user request.
+    matches = re.findall(r"([A-Za-z]:[\\/][^\s`'\"\],)]+)", text or "")
+    if matches:
+        return matches[-1].rstrip(".,;:")
+    matches = re.findall(r"(/c/Users/[^\s`'\"\],)]+)", text or "", re.IGNORECASE)
+    if matches:
+        return matches[-1].rstrip(".,;:")
+    return ""
+
+
+def _extract_requested_limit(text: str, default: int = 10) -> int:
+    t = text or ""
+    m = re.search(r"(?:first|первые|первых|top)\s+(\d{1,3})", t, re.IGNORECASE)
+    if not m:
+        m = re.search(r"(\d{1,3})\s+(?:files|файл)", t, re.IGNORECASE)
+    if m:
+        return max(1, min(int(m.group(1)), 100))
+    return default
+
+
+def _make_tool_call(name: str, arguments: dict) -> list:
+    return [{
+        "id": f"call_{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+    }]
+
+
+def _extract_user_request(prompt: str) -> str:
+    """Extract the last user request from the full prompt (strips instruction boilerplate)."""
+    # Split at section markers to isolate user text
+    sections = re.split(r'\n\n---\n\n', prompt or "")
+    for section in reversed(sections):
+        t = section.strip()
+        # Skip sections that are instruction blocks (start with [TOOL, [SYSTEM)
+        if t.startswith("[") and ("CONTRACT" in t or "REMINDER" in t or "REQUIRED" in t):
+            continue
+        # Skip [TOOL RESULT] sections
+        if t.startswith("[TOOL RESULT"):
+            continue
+        # Skip [ASSISTANT]: sections
+        if t.startswith("[ASSISTANT]") or t.startswith("[SYSTEM]"):
+            continue
+        # Found the user message — strip any [USER]: prefix
+        if t.startswith("[USER]:"):
+            t = t[len("[USER]:"):].strip()
+        if t:
+            return t
+    return prompt[-600:] if prompt else ""
+
+
+def _extract_shell_command(text: str) -> str:
+    """Extract a shell command from user request text."""
+    # Search only the user message, not the full prompt
+    low = (text or "").strip()
+    # "run <command>", "run the following: <command>"
+    for prefix in ["run the command: ", "run the following: ", "run the following command: ",
+                    "run command: ", "run: ", "run ",
+                    "execute: ", "execute ",
+                    "выполни команду: ", "выполни команду ", "выполни: ", "выполни ",
+                    "запусти команду: ", "запусти команду ", "запусти: ", "запусти "]:
+        idx = low.lower().find(prefix)
+        if idx != -1:
+            cmd = low[idx + len(prefix):].strip()
+            # Stop at end of sentence or end of string
+            cmd = re.split(r'[.!;\n]', cmd)[0].strip()
+            if (cmd.startswith("'") and cmd.endswith("'")) or (cmd.startswith('"') and cmd.endswith('"')):
+                cmd = cmd[1:-1]
+            if cmd and len(cmd) < 500:
+                return cmd
+    # Fallback: pick the last line that looks like a command
+    for line in reversed(low.split('\n')):
+        line = line.strip().strip('.,;:')
+        if line and not any(x in line.lower() for x in ["use the", "используй", "tool", "инструмент"]):
+            # Check it doesn't look like instruction text
+            if not line.startswith("[") and len(line.split()) <= 20:
+                return line
+    return ""
+
+
+def _extract_content_for_file(text: str) -> str:
+    """Extract file content from user request — best-effort heuristic."""
+    # Try to find content after markers like "with content:", 'with the text:', etc.
+    patterns = [
+        r'content:\s*["\'](.*?)["\']\s*(?:$|path|file)',
+        r'text:\s*["\'](.*?)["\']\s*(?:$|path|file)',
+        r'содержимым:\s*["\'](.*?)["\']',
+        r'содержимым\s+["\'](.*?)["\']',
+        r'содержимым\s+"(.*?)"',
+        r'say:\s*["\'](.*?)["\']',
+        r'напиши\s+(?:в\s+)?["\'](.*?)["\']',
+        r'запиши\s+(?:в\s+)?["\'](.*?)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text or "", re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _extract_old_new_strings(text: str) -> tuple:
+    """Extract old_string and new_string for patch tool."""
+    low = text or ""
+    # "replace X with Y", "change X to Y", "замени X на Y"
+    m = re.search(r'replace\s+["\'](.*?)["\']\s+with\s+["\'](.*?)["\']', low, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r'change\s+["\'](.*?)["\']\s+to\s+["\'](.*?)["\']', low, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r'замени\s+["\'](.*?)["\']\s+на\s+["\'](.*?)["\']', low, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2)
+    # Try old_string=... new_string=... style
+    m = re.search(r'old_string[=:]\s*["\'](.*?)["\']', low, re.DOTALL | re.IGNORECASE)
+    if m:
+        old_s = m.group(1)
+        m2 = re.search(r'new_string[=:]\s*["\'](.*?)["\']', low, re.DOTALL | re.IGNORECASE)
+        if m2:
+            return old_s, m2.group(1)
+    return "", ""
+
+
+def synthesize_obvious_tool_call(prompt: str, tools: list) -> list:
+    """Last-resort planner for obvious agent tasks when Gemini Web ignores the
+    tool protocol. This does not answer the user; it only returns a real
+    OpenAI-style tool call so the caller can execute the actual tool.
+    """
+    if _prompt_has_tool_result(prompt) or not _looks_like_tool_required_prompt(prompt):
+        return []
+    names = _available_tool_names(tools)
+    text = prompt or ""
+    low = text.lower()
+    path = _extract_windows_or_posix_path(text)
+
+    # Determine if this is a multi-turn (has assistant+tool history) or first turn
+    # by checking for [TOOL RESULT] or actual assistant tool_calls (not instruction examples).
+    # Isolate the "user portion" of the prompt (after [END TOOL CONTRACT]).
+    user_portion = text.split("[END TOOL CONTRACT]", 1)[-1] if "[END TOOL CONTRACT]" in text else text
+    is_multi_turn = "[TOOL RESULT name=" in text or ("```tool_calls" in user_portion and not "```tool_calls" in text.split("[END TOOL CONTRACT]")[0] if "[END TOOL CONTRACT]" in text else "```tool_calls" in text)
+
+    # For all analysis, use only the user's actual request text, not the full prompt
+    user_text = _extract_user_request(user_portion) if not is_multi_turn else text
+    user_low = user_text.lower()
+
+        # 1. READ_FILE — read file contents (most specific: explicit "read/прочитай")
+    if path and "read_file" in names and any(k in user_low for k in ["read", "cat", "прочитай", "содержимое", "открой"]):
+        return _make_tool_call("read_file", {"path": path})
+
+    # 2. WRITE_FILE — create/write a file
+    content = _extract_content_for_file(text)
+    if path and "write_file" in names and any(k in user_low for k in [
+        "write file", "create file", "write to file", "save to file",
+        "запиши в файл", "создай файл", "запиши файл"
+    ]):
+        kwargs = {"path": path}
+        if content:
+            kwargs["content"] = content
+        return _make_tool_call("write_file", kwargs)
+
+    # 3. PATCH — edit a file (replace text)
+    if path and "patch" in names and any(k in user_low for k in [
+        "replace", "change", "edit file", "patch", "редактируй", "измени", "замени"
+    ]):
+        old_s, new_s = _extract_old_new_strings(text)
+        if old_s:
+            return _make_tool_call("patch", {
+                "path": path,
+                "old_string": old_s,
+                "new_string": new_s or "",
+            })
+
+    # 4. SEARCH_FILES — list/search files/directories (generic catch-all for files)
+    if path and "search_files" in names and any(k in user_low for k in [
+        "list", "show", "first", "files", "directory", "покажи", "первые", "файлы", "файлов", "директори", "список"
+    ]):
+        return _make_tool_call("search_files", {
+            "pattern": "*",
+            "target": "files",
+            "path": path,
+            "limit": _extract_requested_limit(text, 10),
+        })
+
+    # 5. TERMINAL — run a shell command
+    user_cmd = _extract_shell_command(user_text)
+    if "terminal" in names and any(k in user_low for k in [
+        "run", "execute", "terminal", "command",
+        "выполни", "запусти", "команду", "выполнить команду"
+    ]):
+        if user_cmd and len(user_cmd) > 2:
+            return _make_tool_call("terminal", {"command": user_cmd})
+        if any(k in user_low for k in ["ls", "dir", "echo", "pwd", "cd", "whoami"]):
+            return _make_tool_call("terminal", {"command": next(k for k in ["ls", "dir", "echo", "pwd", "cd", "whoami"] if k in user_low)})
+
+    # 6. WEB_SEARCH / WEB_EXTRACT — search the web
+    if any(n in names for n in {"web_search", "web_extract"}) and any(k in user_low for k in [
+        "search the web", "search online", "search internet", "look up",
+        "найди в интернете", "поищи в интернете", "поищи информацию", "lookup",
+    ]):
+        query = user_text.strip()
+        for prefix in ["search the web for ", "search online for ", "search internet for ", "look up ",
+                        "найди в интернете ", "поищи в интернете ", "поищи информацию "]:
+            idx = query.lower().find(prefix.lower())
+            if idx != -1:
+                query = query[idx + len(prefix):].strip(" .!,;:")
+        if len(query) > 10 and "web_search" in names:
+            return _make_tool_call("web_search", {"query": query[:300]})
+
+    return []
 
 
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
@@ -466,11 +956,38 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools):
+        # If the latest turn obviously requires a local/file tool, do not ask
+        # Gemini Web to "decide" first — it often fabricates a prose answer.
+        # Return a real OpenAI-style tool call so the client executes the tool.
+        if tools and not _prompt_has_tool_result(prompt):
+            synthetic_calls = synthesize_obvious_tool_call(prompt, tools)
+            if synthetic_calls:
+                return "", synthetic_calls
+
         raw = gemini_stream_generate(prompt, model_id, think_mode)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
+
+            # Gemini Web tool use is prompt-emulated, not native function calling.
+            # With real agent schemas it sometimes answers with prose like
+            # "I can't access local files" instead of emitting a tool_calls block.
+            # If this is the first tool round (no tool result yet), give it one
+            # strict repair attempt before returning plain text to the client.
+            attempts = int(CONFIG.get("tool_retry_attempts", 1) or 0)
+            if attempts > 0 and not tool_calls and not _prompt_has_tool_result(prompt) and (_looks_like_missed_tool_call(text) or _looks_like_tool_required_prompt(prompt)):
+                retry_prompt = build_tool_retry_prompt(prompt, text)
+                for _ in range(attempts):
+                    raw_retry = gemini_stream_generate(retry_prompt, model_id, think_mode)
+                    retry_text = extract_response_text(raw_retry)
+                    retry_clean, retry_calls = parse_tool_calls(retry_text or "")
+                    if retry_calls:
+                        return retry_clean or "", retry_calls
+                    text = retry_clean or retry_text or text
+                synthetic_calls = synthesize_obvious_tool_call(prompt, tools)
+                if synthetic_calls:
+                    return "", synthetic_calls
         return text or "", tool_calls
 
     def handle_chat(self, body: bytes):
