@@ -667,15 +667,46 @@ def _available_tool_names(tools: list) -> set:
     return names
 
 
-def _extract_windows_or_posix_path(text: str) -> str:
-    # Good enough for agent repair: C:/Users/..., C:\\Users\\..., /c/Users/...
-    # Use the LAST match: the prompt contains examples before the real user request.
-    matches = re.findall(r"([A-Za-z]:[\\/][^\s`'\"\],)]+)", text or "")
-    if matches:
-        return matches[-1].rstrip(".,;:")
-    matches = re.findall(r"(/c/Users/[^\s`'\"\],)]+)", text or "", re.IGNORECASE)
-    if matches:
-        return matches[-1].rstrip(".,;:")
+def _extract_path(text: str) -> str:
+    """Extract a filesystem path from text — platform-aware.
+
+    Returns the last-matching path from the prompt to prefer the user's real request
+    over instruction examples that appear earlier.
+
+    Windows (os.name == 'nt'):
+      - C:\\Users\\..., C:/Users/...
+      - /c/Users/... (git-bash / MSYS / WSL interop)
+
+    Linux / macOS (os.name == 'posix'):
+      - /home/..., /Users/..., /tmp/..., /var/..., /etc/..., /opt/...
+      - Any absolute path with 2+ levels: /foo/bar/...
+    """
+    t = text or ""
+
+    if os.name == 'nt':
+        # Windows paths
+        matches = re.findall(r"([A-Za-z]:[\\/][^\s`'\"\\],)]+)", t)
+        if matches:
+            return matches[-1].rstrip(".,;:")
+        # git-bash / MSYS / WSL interop paths (/c/Users/...)
+        matches = re.findall(r"(/[a-zA-Z]/[^\s`'\"\\],)]+)", t)
+        if matches:
+            return matches[-1].rstrip(".,;:")
+    else:
+        # Unix-style paths: /home/..., /Users/..., /tmp/..., /var/... etc.
+        # Match absolute paths with at least 2 path components
+        matches = re.findall(
+            r"((?:/home|/Users|/tmp|/var|/etc|/opt|/usr|/bin|/sbin|/lib|/mnt|/media|/run|/srv)"
+            r"(?:/[^\s`'\"\\],)]+)+)",
+            t, re.IGNORECASE,
+        )
+        if matches:
+            return matches[-1].rstrip(".,;:")
+        # Fallback: any absolute path with 3+ components (e.g. /foo/bar/baz)
+        matches = re.findall(r"(/[^\s`'\"\\],)]+/[^\s`'\"\\],)]+/[^\s`'\"\\],)]+)", t)
+        if matches:
+            return matches[-1].rstrip(".,;:")
+
     return ""
 
 
@@ -802,7 +833,7 @@ def synthesize_obvious_tool_call(prompt: str, tools: list) -> list:
     names = _available_tool_names(tools)
     text = prompt or ""
     low = text.lower()
-    path = _extract_windows_or_posix_path(text)
+    path = _extract_path(text)
 
     # Determine if this is a multi-turn (has assistant+tool history) or first turn
     # by checking for [TOOL RESULT] or actual assistant tool_calls (not instruction examples).
