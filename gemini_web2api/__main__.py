@@ -1,49 +1,30 @@
-"""Entry point: python -m gemini_web2api"""
-import argparse
-import os
+"""Package entry point: delegate to the maintained monolithic server.
 
-from .config import CONFIG, load_config, find_config
-from .models import MODELS
-from .gemini import HAS_HTTPX
-from .server import GeminiHandler, ThreadedServer
-from . import __version__
+The repository keeps `gemini_web2api.py` as the canonical implementation used by
+`launch.py`. The older package modules are retained for source compatibility, but
+running `python -m gemini_web2api` or the console script must not silently use a
+stale server without the agent-focused planner/retry/validation logic.
+"""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+def _load_monolith():
+    root = Path(__file__).resolve().parent.parent
+    script = root / "gemini_web2api.py"
+    spec = importlib.util.spec_from_file_location("gemini_for_agents_monolith", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load canonical server from {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--cookie-file", type=str, default=None)
-    parser.add_argument("--proxy", type=str, default=None, help="HTTP proxy, e.g. http://127.0.0.1:7890")
-    parser.add_argument("--version", action="version", version=f"gemini-web2api {__version__}")
-    args = parser.parse_args()
-
-    config_path = args.config or os.environ.get("GEMINI_WEB2API_CONFIG") or find_config()
-    if config_path:
-        load_config(config_path)
-
-    if args.port:
-        CONFIG["port"] = args.port
-    if args.cookie_file:
-        CONFIG["cookie_file"] = args.cookie_file
-    if args.proxy:
-        CONFIG["proxy"] = args.proxy
-
-    port = CONFIG["port"]
-    server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
-    print(f"gemini-web2api v{__version__}")
-    print(f"  Listening: http://0.0.0.0:{port}")
-    print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
-    print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
-    print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
-    print()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-        server.shutdown()
+    module = _load_monolith()
+    return module.main()
 
 
 if __name__ == "__main__":

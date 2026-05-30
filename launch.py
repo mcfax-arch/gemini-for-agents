@@ -40,6 +40,15 @@ def read_pid() -> int | None:
 
 
 def is_pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                stderr=subprocess.DEVNULL,
+            ).decode("mbcs", errors="replace")
+            return str(pid) in out and "INFO:" not in out
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True

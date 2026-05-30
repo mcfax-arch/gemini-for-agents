@@ -684,26 +684,27 @@ def _extract_path(text: str) -> str:
     t = text or ""
 
     if os.name == 'nt':
-        # Windows paths
-        matches = re.findall(r"([A-Za-z]:[\\/][^\s`'\"\\],)]+)", t)
+        # Windows paths. Allow both slash and backslash as path separators after
+        # the drive prefix; stop only at whitespace/quotes/common punctuation.
+        matches = re.findall(r"([A-Za-z]:[\\/][^\s`'\"\],)]+)", t)
         if matches:
             return matches[-1].rstrip(".,;:")
         # git-bash / MSYS / WSL interop paths (/c/Users/...)
-        matches = re.findall(r"(/[a-zA-Z]/[^\s`'\"\\],)]+)", t)
+        matches = re.findall(r"(/[a-zA-Z]/[^\s`'\"\\\],)]+)", t)
         if matches:
             return matches[-1].rstrip(".,;:")
     else:
-        # Unix-style paths: /home/..., /Users/..., /tmp/..., /var/... etc.
+
         # Match absolute paths with at least 2 path components
         matches = re.findall(
             r"((?:/home|/Users|/tmp|/var|/etc|/opt|/usr|/bin|/sbin|/lib|/mnt|/media|/run|/srv)"
-            r"(?:/[^\s`'\"\\],)]+)+)",
+            r"(?:/[^\s`'\"\\\],)]+)+)",
             t, re.IGNORECASE,
         )
         if matches:
             return matches[-1].rstrip(".,;:")
         # Fallback: any absolute path with 3+ components (e.g. /foo/bar/baz)
-        matches = re.findall(r"(/[^\s`'\"\\],)]+/[^\s`'\"\\],)]+/[^\s`'\"\\],)]+)", t)
+        matches = re.findall(r"(/[^\s`'\"\\\],)]+/[^\s`'\"\\\],)]+/[^\s`'\"\\\],)]+)", t)
         if matches:
             return matches[-1].rstrip(".,;:")
 
@@ -726,6 +727,104 @@ def _make_tool_call(name: str, arguments: dict) -> list:
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
     }]
+
+
+def _find_tool_schema(name: str, tools: list) -> dict | None:
+    """Find the JSON schema for a tool by name."""
+    for tool in tools or []:
+        fn = _tool_function(tool)
+        if fn.get("name") == name:
+            return fn["parameters"] if isinstance(fn.get("parameters"), dict) else {"type": "object", "properties": {}}
+    return None
+
+
+def _validate_tool_calls(tool_calls: list, tools: list) -> tuple:
+    """Validate tool call arguments against their schemas.
+
+    Returns (valid_calls, errors) where errors is a list of descriptive messages
+    for calls with invalid or missing required arguments.
+    """
+    if not tool_calls or not tools:
+        return tool_calls or [], []
+
+    valid = []
+    errors = []
+
+    for tc in tool_calls:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        name = fn.get("name", "")
+        if not name:
+            valid.append(tc)
+            continue
+
+        args_raw = fn.get("arguments", {})
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw) if args_raw.strip() else {}
+            except json.JSONDecodeError:
+                errors.append(f"Tool '{name}': arguments is not valid JSON")
+                continue
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            errors.append(f"Tool '{name}': invalid arguments type")
+            continue
+
+        schema = _find_tool_schema(name, tools)
+        if not schema:
+            valid.append(tc)
+            continue
+
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        # Check required args
+        missing = [r for r in required if r not in args or args[r] is None or (isinstance(args[r], str) and not args[r].strip())]
+        if missing:
+            # Try to fix: add sensible defaults where possible
+            fixed = False
+            for m in missing:
+                prop_schema = props.get(m, {})
+                default_val = prop_schema.get("default")
+                if default_val is not None:
+                    args[m] = default_val
+                    fixed = True
+                elif prop_schema.get("type") in ("string", "") and "default" not in prop_schema:
+                    args[m] = ""
+                    fixed = True
+
+            if not fixed:
+                errors.append(f"Tool '{name}': missing required arguments: {', '.join(missing)}")
+                continue
+
+        # Type check basic types
+        for arg_name, arg_val in list(args.items()):
+            prop_schema = props.get(arg_name, {})
+            expected_type = prop_schema.get("type", "")
+            if expected_type == "integer" and isinstance(arg_val, (int, float)) and not isinstance(arg_val, bool):
+                if isinstance(arg_val, float):
+                    args[arg_name] = int(arg_val)
+            elif expected_type == "number" and isinstance(arg_val, (int, float)) and not isinstance(arg_val, bool):
+                pass
+            elif expected_type == "string" and isinstance(arg_val, (int, float)):
+                args[arg_name] = str(arg_val)
+            elif expected_type == "array" and isinstance(arg_val, list):
+                pass
+            elif expected_type == "boolean" and isinstance(arg_val, (bool, int)):
+                if isinstance(arg_val, int):
+                    args[arg_name] = bool(arg_val)
+
+            # Check enums
+            enum_vals = prop_schema.get("enum", [])
+            if enum_vals and arg_val not in enum_vals:
+                if len(enum_vals) > 0:
+                    args[arg_name] = enum_vals[0]  # use first valid value
+
+        # Rebuild the tool call with fixed arguments
+        tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
+        valid.append(tc)
+
+    return valid, errors
 
 
 def _extract_user_request(prompt: str) -> str:
@@ -833,10 +932,9 @@ def synthesize_obvious_tool_call(prompt: str, tools: list) -> list:
     names = _available_tool_names(tools)
     text = prompt or ""
     low = text.lower()
-    path = _extract_path(text)
 
     # Determine if this is a multi-turn (has assistant+tool history) or first turn
-    # by checking for [TOOL RESULT] or actual assistant tool_calls (not instruction examples).
+
     # Isolate the "user portion" of the prompt (after [END TOOL CONTRACT]).
     user_portion = text.split("[END TOOL CONTRACT]", 1)[-1] if "[END TOOL CONTRACT]" in text else text
     is_multi_turn = "[TOOL RESULT name=" in text or ("```tool_calls" in user_portion and not "```tool_calls" in text.split("[END TOOL CONTRACT]")[0] if "[END TOOL CONTRACT]" in text else "```tool_calls" in text)
@@ -844,8 +942,9 @@ def synthesize_obvious_tool_call(prompt: str, tools: list) -> list:
     # For all analysis, use only the user's actual request text, not the full prompt
     user_text = _extract_user_request(user_portion) if not is_multi_turn else text
     user_low = user_text.lower()
+    path = _extract_path(user_text)
 
-        # 1. READ_FILE — read file contents (most specific: explicit "read/прочитай")
+    # 1. READ_FILE — read file contents (most specific: explicit "read/прочитай")
     if path and "read_file" in names and any(k in user_low for k in ["read", "cat", "прочитай", "содержимое", "открой"]):
         return _make_tool_call("read_file", {"path": path})
 
@@ -993,13 +1092,29 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if tools and not _prompt_has_tool_result(prompt):
             synthetic_calls = synthesize_obvious_tool_call(prompt, tools)
             if synthetic_calls:
-                return "", synthetic_calls
+                valid_calls, errors = _validate_tool_calls(synthetic_calls, tools)
+                if errors:
+                    log(f"[VALIDATE] Planner: {'; '.join(errors)}")
+                if valid_calls:
+                    return "", valid_calls
 
         raw = gemini_stream_generate(prompt, model_id, think_mode)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
+
+            # Validate parsed tool calls against schema
+            if tool_calls:
+                valid_calls, errors = _validate_tool_calls(tool_calls, tools)
+                if errors:
+                    log(f"[VALIDATE] Gemini: {'; '.join(errors)}")
+                if not valid_calls and not text.strip():
+                    # All calls were invalid — force retry
+                    tool_calls = None
+                    text = "[VALIDATION ERROR] All tool calls rejected by schema check."
+                else:
+                    tool_calls = valid_calls
 
             # Gemini Web tool use is prompt-emulated, not native function calling.
             # With real agent schemas it sometimes answers with prose like
@@ -1014,11 +1129,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     retry_text = extract_response_text(raw_retry)
                     retry_clean, retry_calls = parse_tool_calls(retry_text or "")
                     if retry_calls:
-                        return retry_clean or "", retry_calls
+                        valid_calls, errors = _validate_tool_calls(retry_calls, tools)
+                        if errors:
+                            log(f"[VALIDATE] Retry: {'; '.join(errors)}")
+                        if valid_calls:
+                            return retry_clean or "", valid_calls
                     text = retry_clean or retry_text or text
                 synthetic_calls = synthesize_obvious_tool_call(prompt, tools)
                 if synthetic_calls:
-                    return "", synthetic_calls
+                    valid_calls, errors = _validate_tool_calls(synthetic_calls, tools)
+                    if errors:
+                        log(f"[VALIDATE] Last-resort planner: {'; '.join(errors)}")
+                    if valid_calls:
+                        return "", valid_calls
         return text or "", tool_calls
 
     def handle_chat(self, body: bytes):

@@ -16,9 +16,9 @@ Google Gemini → OpenAI-compatible API proxy, заточенный под AI-а
 
 Форк [gemini-web2api](https://github.com/Sophomoresty/gemini-web2api) с фокусом на работу AI-агентов:
 
-- **Детерминированный planner** — когда Gemini «забывает» вызвать инструмент, синтезатор анализирует запрос и вызывает нужный tool самостоятельно
-- **Retry/repair tool calls** — если Gemini вернула сломанный JSON или пропустила tool call, сервер автоматически перестраивает запрос
-- **Compact tool definitions** — схемы инструментов упакованы в 2–3× меньший размер без потери функциональности
+- **Детерминированный planner** — когда Gemini «забывает» вызвать инструмент, синтезатор анализирует запрос и вызывает нужный tool самостоятельно: распознаёт read_file, write_file, patch, search_files, terminal, web_search по ключевым словам
+- **Retry/repair tool calls** — если Gemini вернула сломанный JSON или пропустила tool call, сервер автоматически перестраивает запрос. **Валидация аргументов** — проверка tool calls против JSON схемы с авто-фиксом типов и enum
+- **Compact tool definitions** — схемы инструментов сокращены (описания до 120 символов) для меньшего расхода контекста Gemini
 - **Кроссплатформенный парсинг путей** — корректно извлекает пути Windows (`C:\...`), Linux (`/home/...`), macOS (`/Users/...`) и git-bash (`/c/Users/...`) в зависимости от ОС
 - **Кроссплатформенный запуск** — один `launch.py` управляет демоном на всех ОС; один `install.py` создаёт сервис автозапуска (Task Scheduler, launchd или systemd)
 
@@ -31,6 +31,12 @@ Google Gemini → OpenAI-compatible API proxy, заточенный под AI-а
 ```bash
 # Linux / macOS / Windows (git-bash, WSL, PowerShell)
 curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.py | python3
+```
+
+Если на Windows нет `python3`, используйте `python`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mcfax-arch/gemini-for-agents/main/install.py | python
 ```
 
 Эта команда:
@@ -63,6 +69,16 @@ python launch.py --restart     # перезапустить
 ```bash
 python gemini_web2api.py
 ```
+
+**Package entrypoint:**
+```bash
+python -m gemini_web2api
+gemini-for-agents
+```
+
+Оба entrypoint'а используют один и тот же maintained server (`gemini_web2api.py`),
+поэтому planner/retry/validation работают одинаково при запуске через файл,
+`python -m ...` или console script.
 
 Сервер доступен на `http://localhost:8081/v1`.
 
@@ -107,6 +123,7 @@ rm -rf ~/.gemini-for-agents
 | `Dockerfile` | Docker-образ |
 | `docker-compose.local.yml` | Docker Compose |
 | `pyproject.toml` | Метаданные пакета |
+| `audit_gemini_for_agents.py` | Локальный audit/test runner для parser/planner/live API/Hermes-style tool loop |
 
 ---
 
@@ -223,6 +240,39 @@ curl http://localhost:8081/v1/chat/completions \
 | `log_requests` | Логировать ли запросы |
 
 Прокси также подхватывается из переменных окружения `HTTPS_PROXY` / `HTTP_PROXY`.
+
+---
+
+## Проверка и аудит
+
+Быстрый syntax check:
+
+```bash
+python -m py_compile gemini_web2api.py launch.py install.py gemini_web2api/*.py
+```
+
+Глубокий audit/test runner:
+
+```bash
+python audit_gemini_for_agents.py
+```
+
+Он проверяет:
+
+- парсинг `tool_calls`, `tool_call`, `json` fences и raw JSON;
+- repair простых JSON-ошибок;
+- валидацию tool arguments по JSON schema;
+- deterministic planner для file/search задач;
+- live `/v1/chat/completions` и `/v1/responses` на `http://127.0.0.1:8081/v1`;
+- continuation после tool result.
+
+Результат пишется в `audit_gemini_for_agents.results.json` и не коммитится.
+
+### Кросс-ОС проверки
+
+- **Windows:** `launch.py --status` использует `tasklist`, потому что `os.kill(pid, 0)` ненадёжен для проверки чужого detached process. Пути поддерживаются как `C:/...`, `C:\\...` и `/c/...`.
+- **macOS/Linux:** `launch.py` использует обычный POSIX PID check через `os.kill(pid, 0)` и запускает daemon через double-fork.
+- **Package mode:** `python -m gemini_web2api` делегирует в `gemini_web2api.py`, чтобы не расходилась логика между ОС и способами запуска.
 
 ---
 

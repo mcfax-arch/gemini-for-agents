@@ -8,3 +8,4 @@ cookie.txt
 cookie.json
 .env
 logs/
+audit_gemini_for_agents.results.json
