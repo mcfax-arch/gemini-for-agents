@@ -59,6 +59,8 @@ DEFAULT_CONFIG = {
     # Tool calling is prompt-emulated because Gemini Web has no public native
     # function-calling protocol. Keep this strict and compact for agent use.
     "tool_retry_attempts": 1,
+    "empty_tool_result_retry_attempts": 1,
+    "tool_result_recovery_max_chars": 24000,
     "tool_description_max_chars": 220,
     "tool_property_description_max_chars": 120,
 }
@@ -568,6 +570,34 @@ def _prompt_has_tool_result(prompt: str) -> bool:
     # The instruction text also mentions "[TOOL RESULT]" as a concept, so do
     # not treat that as an executed tool result.
     return "[TOOL RESULT name=" in (prompt or "")
+
+
+def build_tool_result_recovery_prompt(prompt: str) -> str:
+    """Build a smaller prompt when Gemini returns empty after tool results.
+
+    Gemini Web occasionally returns HTTP 200 with no parseable text when the
+    full Hermes prompt contains a large tool contract + long history + tool
+    results. The information needed for the final answer is normally in the
+    latest tool-result tail, so retry with a compact continuation prompt.
+    """
+    text = prompt or ""
+    marker = "[TOOL RESULT name="
+    idx = text.rfind(marker)
+    tail_start = max(0, idx - 6000) if idx >= 0 else max(0, len(text) - 12000)
+    tail = text[tail_start:]
+    max_chars = int(CONFIG.get("tool_result_recovery_max_chars", 24000) or 24000)
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return (
+        "You are continuing a Hermes Agent task on Windows 11.\n"
+        "The previous response was empty after tool execution.\n"
+        "Use the tool results below to answer the user's request directly.\n"
+        "Do not call more tools unless absolutely necessary.\n\n"
+        "[RECENT CONVERSATION AND TOOL RESULTS]\n"
+        f"{tail}\n"
+        "[END]\n\n"
+        "Now provide the final answer in Russian if the user wrote Russian."
+    )
 
 
 def _messages_have_tool_result(messages: list) -> bool:
@@ -1101,6 +1131,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         raw = gemini_stream_generate(prompt, model_id, think_mode)
         text = extract_response_text(raw)
         tool_calls = None
+
+        if not text.strip() and tools and _prompt_has_tool_result(prompt):
+            attempts = int(CONFIG.get("empty_tool_result_retry_attempts", 1) or 0)
+            for attempt in range(attempts):
+                log(
+                    "[RECOVER] Empty response after tool results; "
+                    f"retrying with compact prompt ({attempt + 1}/{attempts}, "
+                    f"raw={len(raw)} bytes, prompt={len(prompt)} chars)"
+                )
+                recovery_prompt = build_tool_result_recovery_prompt(prompt)
+                raw_retry = gemini_stream_generate(recovery_prompt, model_id, think_mode)
+                retry_text = extract_response_text(raw_retry)
+                if retry_text.strip():
+                    text = retry_text
+                    break
+
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
 
